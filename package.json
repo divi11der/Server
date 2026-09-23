@@ -1,0 +1,10 @@
+{
+  "name": "attention-please-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Room directory and WebSocket game traffic relay for Attention Please!",
+  "main": "master_server.js",
+  "scripts": {
+    "start": "node master_server.js"
+  }
+}
