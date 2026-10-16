@@ -8,13 +8,15 @@ const ttlMs = 60_000;
 const rooms = new Map();
 const activeRooms = new Map();
 const WS_OPEN = 1;
+const MAX_FRAME_BYTES = 1024 * 1024;
+const MAX_QUEUED_BYTES = 512 * 1024;
 
 function removeRoom(id) {
   rooms.delete(id);
   const room = activeRooms.get(id);
   if (room) {
     room.host?.close(1001, 'room_closed');
-    room.client?.close(1001, 'room_closed');
+    for (const client of room.clients.values()) client.close(1001, 'room_closed');
     activeRooms.delete(id);
   }
 }
@@ -53,8 +55,12 @@ function createWebSocket(socket, initialData) {
     emit(event, value) {
       for (const callback of handlers.get(event) || []) callback(value);
     },
-    send(value) {
-      if (ws.readyState === WS_OPEN) socket.write(encodeFrame(1, value));
+    send(value, droppable = false) {
+      if (ws.readyState !== WS_OPEN) return;
+      // Movement and world snapshots are superseded by the next snapshot.
+      // Do not let one slow connection build up seconds of stale game state.
+      if (droppable && socket.writableLength > MAX_QUEUED_BYTES) return;
+      socket.write(encodeFrame(1, value));
     },
     close(code = 1000, reason = '') {
       if (ws.readyState !== WS_OPEN) return;
@@ -87,11 +93,11 @@ function createWebSocket(socket, initialData) {
       } else if (length === 127) {
         if (buffer.length < 10) return;
         const wideLength = buffer.readBigUInt64BE(2);
-        if (wideLength > 65536n) return ws.close(1009, 'message_too_large');
+        if (wideLength > BigInt(MAX_FRAME_BYTES)) return ws.close(1009, 'message_too_large');
         length = Number(wideLength);
         offset = 10;
       }
-      if (!masked || length > 65536) return ws.close(1002, 'invalid_frame');
+      if (!masked || length > MAX_FRAME_BYTES) return ws.close(1002, 'invalid_frame');
       if (buffer.length < offset + 4 + length) return;
       const mask = buffer.subarray(offset, offset + 4);
       offset += 4;
@@ -168,7 +174,7 @@ const server = http.createServer(async (req, res) => {
       removeRoom(data.id);
       return send(res, 200, { status: 'removed' });
     }
-    if (typeof data.name !== 'string' || data.address !== 'relay' || !Number.isInteger(data.port) || data.port < 1 || data.port > 65535 || !Number.isInteger(data.players) || data.players < 1 || data.players > 2) {
+    if (typeof data.name !== 'string' || data.address !== 'relay' || !Number.isInteger(data.port) || data.port < 1 || data.port > 65535 || !Number.isInteger(data.players) || data.players < 1 || data.players > 4) {
       return send(res, 400, { error: 'invalid_room' });
     }
     const address = data.address;
@@ -179,8 +185,8 @@ const server = http.createServer(async (req, res) => {
       address,
       local_address: typeof data.local_address === 'string' && net.isIP(data.local_address) === 4 ? data.local_address : '',
       port: data.port,
-      players: data.players,
-      max_players: 2,
+      players: activeRooms.get(data.id)?.host ? 1 + activeRooms.get(data.id).clients.size : data.players,
+      max_players: 4,
       updated: Date.now(),
     });
     return send(res, 200, { status: 'listed' });
@@ -202,15 +208,20 @@ server.on('upgrade', (req, socket, head) => {
 function handleRelayConnection(ws, url) {
   const role = url.searchParams.get('role');
   const roomId = url.searchParams.get('room');
+  if (url.searchParams.get('protocol') !== '4') {
+    ws.close(1008, 'update_required');
+    return;
+  }
   if (!/^[a-fA-F0-9]{16,64}$/.test(roomId || '') || !rooms.has(roomId)) {
     ws.close(1008, 'room_not_found');
     return;
   }
   let room = activeRooms.get(roomId);
   if (!room) {
-    room = { host: null, client: null };
+    room = { host: null, clients: new Map() };
     activeRooms.set(roomId, room);
   }
+  let peerId = 0;
   if (role === 'host') {
     if (room.host && room.host.readyState === WS_OPEN) {
       ws.close(1008, 'host_already_connected');
@@ -223,13 +234,15 @@ function handleRelayConnection(ws, url) {
       ws.close(1008, 'host_not_connected');
       return;
     }
-    if (room.client && room.client.readyState === WS_OPEN) {
+    peerId = [2, 3, 4].find(id => !room.clients.has(id)) || 0;
+    if (peerId === 0) {
       ws.close(1008, 'room_full');
       return;
     }
-    room.client = ws;
-    ws.send(JSON.stringify({ type: 'welcome', peer_id: 2 }));
-    room.host.send(JSON.stringify({ type: 'peer_joined', peer_id: 2 }));
+    room.clients.set(peerId, ws);
+    rooms.get(roomId).players = 1 + room.clients.size;
+    ws.send(JSON.stringify({ type: 'welcome', peer_id: peerId }));
+    room.host.send(JSON.stringify({ type: 'peer_joined', peer_id: peerId }));
     console.log(`Relay player connected to room ${roomId}`);
   } else {
     ws.close(1008, 'invalid_role');
@@ -240,23 +253,51 @@ function handleRelayConnection(ws, url) {
     let message;
     try { message = JSON.parse(raw.toString()); } catch { return; }
     if (role === 'client' && room.host?.readyState === WS_OPEN && message.type === 'input') {
-      room.host.send(JSON.stringify({ type: 'input', peer_id: 2, x: Number(message.x) || 0, y: Number(message.y) || 0 }));
+      const nickname = typeof message.name === 'string'
+        ? message.name.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 20)
+        : '';
+      // Forward the complete input envelope. The client uses the numeric x/y
+      // markers for movement, while editor, wardrobe, baggage, food and
+      // passenger actions travel in the additional fields below. Keeping the
+      // relay transparent here prevents online-only desyncs.
+      const inputX = Number(message.x) || 0;
+      const canDrop = !message.jump && ((inputX >= -1.5 && inputX <= 1.5) || inputX > 9
+        || inputX === -21 || (inputX === -35 && !message.vehicle_action));
+      room.host.send(JSON.stringify({
+        ...message,
+        type: 'input',
+        peer_id: peerId,
+        x: inputX,
+        y: Number(message.y) || 0,
+        jump: message.jump === true,
+        gait: Number(message.gait) || 0,
+        name: nickname,
+      }), canDrop);
     } else if (role === 'client' && room.host?.readyState === WS_OPEN && message.type === 'ping') {
-      room.host.send(JSON.stringify({ type: 'ping', timestamp: Number(message.timestamp) || 0 }));
-    } else if (role === 'host' && room.client?.readyState === WS_OPEN && (message.type === 'state' || message.type === 'pong')) {
-      room.client.send(JSON.stringify(message));
+      room.host.send(JSON.stringify({ type: 'ping', peer_id: peerId, timestamp: Number(message.timestamp) || 0 }));
+    } else if (role === 'host' && (message.type === 'state' || message.type === 'pong')) {
+      const packet = JSON.stringify(message);
+      if (message.type === 'pong' && room.clients.has(Number(message.peer_id))) {
+        const target = room.clients.get(Number(message.peer_id));
+        if (target.readyState === WS_OPEN) target.send(packet);
+      } else {
+        for (const client of room.clients.values()) if (client.readyState === WS_OPEN) client.send(packet, message.type === 'state');
+      }
     }
   });
   ws.on('close', () => {
     if (role === 'host' && room.host === ws) {
       room.host = null;
-      room.client?.close(1001, 'host_disconnected');
-      room.client = null;
-    } else if (role === 'client' && room.client === ws) {
-      room.client = null;
-      if (room.host?.readyState === WS_OPEN) room.host.send(JSON.stringify({ type: 'peer_left', peer_id: 2 }));
+      for (const client of room.clients.values()) client.close(1001, 'host_disconnected');
+      room.clients.clear();
+    } else if (role === 'client' && room.clients.get(peerId) === ws) {
+      room.clients.delete(peerId);
+      if (rooms.has(roomId)) rooms.get(roomId).players = 1 + room.clients.size;
+      const departure = JSON.stringify({ type: 'peer_left', peer_id: peerId });
+      if (room.host?.readyState === WS_OPEN) room.host.send(departure);
+      for (const client of room.clients.values()) if (client.readyState === WS_OPEN) client.send(departure);
     }
-    if (!room.host && !room.client) activeRooms.delete(roomId);
+    if (!room.host && room.clients.size === 0) activeRooms.delete(roomId);
   });
 }
 
